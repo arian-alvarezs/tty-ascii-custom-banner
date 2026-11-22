@@ -9,8 +9,21 @@ DEF_REPO="arian-alvarezs/tty-ascii-custom-banner"; DEF_BRANCH="main"; DEF_PATH="
 R="${TTYB_ROOT:-}"; [ -n "$R" ] && export TTYB_ROOT
 LIB="$R/usr/local/lib/tty-banner"; SHARE="$R/usr/local/share/tty-banner"; STATE="$R/var/lib/tty-banner"
 BK="$STATE/backup"; CONF="$R/etc/tty-banner.conf"; TTY_IN="${TTYB_TTY:-/dev/tty}"
-LANG_UI=en
-case "${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}" in es*) LANG_UI=es;; esac
+LANG_UI=en; LANG_SET=0
+detect_lang() {
+  local loc="${LC_ALL:-${LC_MESSAGES:-${LANG:-${LANGUAGE:-}}}}"
+  if [ -z "$loc" ] || [ "$loc" = C ] || [ "$loc" = C.UTF-8 ] || [ "$loc" = POSIX ]; then
+    local f v=""
+    for f in "$R/etc/locale.conf" "$R/etc/default/locale"; do
+      [ -r "$f" ] || continue
+      v=$(grep -m1 -E '^[[:space:]]*(LC_ALL|LC_MESSAGES|LANG)=' "$f" 2>/dev/null || true)
+      v=${v#*=}; v=${v%%#*}; v=${v//\"/}; v=${v//\'/}
+      [ -n "$v" ] && { loc="$v"; break; }
+    done
+  fi
+  case "$loc" in es*) LANG_UI=es;; *) LANG_UI=en;; esac
+}
+detect_lang
 MODE=install; PREVIEW_ONLY=0; ASSUME_YES=0; NO_DEPS=0
 SRC=""; LOCAL_PATH=""; REPO_SEL=""; REPO_SPEC="$DEF_REPO@$DEF_BRANCH:$DEF_PATH"
 FLAG_ROTATE=""; FLAG_SSH=""; FLAG_MOTD=""; FONT_OPT="auto"; TTYS="1"; INFO_OPT="auto"; FILL_OPT="ascii"
@@ -36,6 +49,19 @@ confirm() { # confirm "es" "en" default(y|n)
   if [ "$ASSUME_YES" = 1 ] || ! have_tty; then [ "$d" = y ]; return; fi
   readline "$1 $h" "$2 $h" || { [ "$d" = y ]; return; }
   case "$REPLY" in "") [ "$d" = y ];; [sSyY]*) return 0;; *) return 1;; esac
+}
+choose_lang() {
+  [ "$LANG_SET" = 0 ] && [ "$ASSUME_YES" = 0 ] && have_tty || return 0
+  local def=2 auto_lbl="English"
+  if [ "$LANG_UI" = es ]; then def=1; auto_lbl="Espanol"; fi
+  printf '\nIdioma / Language (auto: %s):\n  1) Espanol\n  2) English\n' "$auto_lbl" >&2
+  readline "Elige / Choose [1-2, Enter=$def]:" "Elige / Choose [1-2, Enter=$def]:" || return 0
+  case "$REPLY" in
+    1|es|ES) LANG_UI=es;;
+    2|en|EN) LANG_UI=en;;
+    "") ;;
+    *) warn "Opcion no valida; se usa $auto_lbl." "Invalid option; using $auto_lbl.";;
+  esac
 }
 sctl() { if [ -n "${TTYB_NO_SYSTEMD:-}" ]; then echo "(sim) systemctl $*" >&2; return 0; fi; systemctl "$@"; }
 
@@ -76,7 +102,7 @@ OPCIONES
   --no-deps           No instalar paquetes (python3, Pillow, fuentes)
   -y, --yes           Aceptar valores por defecto sin preguntar (rotacion/SSH/MOTD siguen en NO
                       salvo que se indiquen con sus opciones)
-  --lang es|en        Idioma de los mensajes
+  --lang es|en        Idioma de los mensajes (por defecto: automatico segun sistema / guia)
   --help-es / --help-en    Esta ayuda en espanol / ingles
   -v, --version
 
@@ -134,7 +160,7 @@ OPTIONS
   --no-deps           Do not install packages (python3, Pillow, fonts)
   -y, --yes           Accept defaults without asking (rotation/SSH/MOTD stay OFF unless given
                       with their options)
-  --lang es|en        Message language
+  --lang es|en        Message language (default: auto-detected from system / wizard)
   --help-es / --help-en    This help in Spanish / English
   -v, --version
 
@@ -490,7 +516,7 @@ main() {
       --help-es) help_es; exit 0;; --help-en) help_en; exit 0;;
       -h|--help) if [ "$LANG_UI" = es ]; then help_es; else help_en; fi; exit 0;;
       -v|--version) echo "tty-banner $VERSION"; exit 0;;
-      --lang) LANG_UI="${2:-en}"; shift;;
+      --lang) LANG_UI="${2:-en}"; LANG_SET=1; shift;;
       --uninstall) MODE=uninstall;; --preview) PREVIEW_ONLY=1;; --diagnose) MODE=diagnose;;
       --local) SRC=local; LOCAL_PATH="${2:-}"; shift;;
       --repo) SRC=repo; if [ $# -gt 1 ] && [ "${2#-}" = "$2" ]; then REPO_SEL="$2"; shift; fi;;
@@ -510,6 +536,7 @@ main() {
   if [ "$MODE" = uninstall ]; then ensure_python; extract_engine; do_uninstall; return; fi
   if [ "$MODE" = diagnose ]; then ensure_python; extract_engine; eng diagnose; return; fi
   [ "$PREVIEW_ONLY" = 1 ] || need_root
+  if [ "$PREVIEW_ONLY" = 0 ] || [ -z "$SRC" ]; then choose_lang; fi
   ensure_python; extract_engine
   pick_source; convert_all
   if [ "$PREVIEW_ONLY" = 1 ]; then SEL=("${TBNS[@]}"); analyze_original; preview_all; return; fi
