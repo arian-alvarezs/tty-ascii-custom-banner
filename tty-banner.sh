@@ -219,8 +219,19 @@ pick_source() {
   fi
   if [ "$SRC" = local ]; then
     if [ -z "$LOCAL_PATH" ]; then
-      readline "Ruta de la imagen o carpeta:" "Path of the image or folder:" || die "Falta --local RUTA." "Missing --local PATH."
-      LOCAL_PATH="${REPLY/#\~/$HOME}"
+      local p; if [ "$LANG_UI" = es ]; then p="Ruta de la imagen o carpeta:"; else p="Path of the image or folder:"; fi
+      REPLY=""; have_tty || die "Falta --local RUTA." "Missing --local PATH."
+      if [ -n "${TTYB_TTY:-}" ]; then
+        printf '%s ' "$p" >&2
+        IFS= read -r REPLY <&3 || die "Falta --local RUTA." "Missing --local PATH."
+        echo "$REPLY" >&2
+      else
+        IFS= read -r -e -p "$p " REPLY <"$TTY_IN" || die "Falta --local RUTA." "Missing --local PATH."
+      fi
+      LOCAL_PATH="${REPLY/#\~/${HOME:-}}"
+      if [ ! -e "$LOCAL_PATH" ]; then
+        while [[ "$LOCAL_PATH" == *[[:space:]] ]]; do LOCAL_PATH="${LOCAL_PATH%?}"; done
+      fi
     fi
     if [ -d "$LOCAL_PATH" ]; then mapfile -t IMGS < <(list_images_dir "$LOCAL_PATH")
     elif [ -f "$LOCAL_PATH" ]; then IMGS=("$LOCAL_PATH")
@@ -508,7 +519,7 @@ main() {
 engine_src() { cat <<'__TTYB_ENGINE_EOF__'
 #!/usr/bin/env python3
 # tty-banner engine: convert images -> .tbn, render banners, apply them at getty start.
-import unicodedata, os, sys, re, zlib, gzip, struct, random, socket, subprocess, glob, hashlib, urllib.request, urllib.error, urllib.parse, json
+import math, unicodedata, os, sys, re, zlib, gzip, struct, random, socket, subprocess, glob, hashlib, urllib.request, urllib.error, urllib.parse, json
 
 ROOT = os.environ.get("TTYB_ROOT", "")
 def P(p): return ROOT + p
@@ -635,49 +646,172 @@ def load_image(path):
 
 # ---------------------------------------------------------------- palette / convert
 def dist(a, b):
-    return 2 * (a[0] - b[0]) ** 2 + 4 * (a[1] - b[1]) ** 2 + 3 * (a[2] - b[2]) ** 2
+    rm = (a[0] + b[0]) * 0.5
+    dr, dg, db = a[0] - b[0], a[1] - b[1], a[2] - b[2]
+    return (2.0 + rm / 256.0) * dr * dr + 4.0 * dg * dg + (2.0 + (255.0 - rm) / 256.0) * db * db
 
 
-def wmedian_cut(pts, k):
-    boxes = [pts]
-    while len(boxes) < k:
-        best, bs = None, 0
-        for i, b in enumerate(boxes):
-            if len(b) < 2: continue
-            rng = [max(c[0][a] for c in b) - min(c[0][a] for c in b) for a in range(3)]
-            s = max(rng) * (sum(c[1] for c in b) ** 0.5)
-            if s > bs: bs, best = s, (i, rng.index(max(rng)))
-        if best is None: break
-        i, a = best
-        b = sorted(boxes.pop(i), key=lambda c: c[0][a])
-        tot, acc, m = sum(c[1] for c in b), 0.0, 1
-        for j, c in enumerate(b):
-            acc += c[1]
-            if acc >= tot / 2.0: m = min(max(j, 1), len(b) - 1); break
-        boxes += [b[:m], b[m:]]
-    return [tuple(sum(c[0][a] * c[1] for c in b) / sum(c[1] for c in b) for a in range(3)) for b in boxes]
+def find_non_transition(px, mask, w, h, x0, y0, x1, y1):
+    """Ignore edge/anti-aliased transition pixels while preserving solid details, outlines, and smooth gradients."""
+    keep = bytearray(mask)
+    if (x1 - x0) < 24 or (y1 - y0) < 24:
+        return keep
+    for y in range(y0, y1):
+        row = y * w
+        ym1 = (y - 1) * w if y > 0 else row
+        yp1 = (y + 1) * w if y + 1 < h else row
+        for x in range(x0, x1):
+            i = row + x
+            if not mask[i]:
+                continue
+            p = px[i]
+            if p[3] < 220:
+                keep[i] = 0
+                continue
+            xm1 = x - 1 if x > 0 else x
+            xp1 = x + 1 if x + 1 < w else x
+            is_trans = False
+            for ia, ib in ((row + xm1, row + xp1), (ym1 + x, yp1 + x)):
+                a, b = px[ia], px[ib]
+                if a[3] < 64 or b[3] < 64:
+                    continue
+                if abs(a[0] - b[0]) + abs(a[1] - b[1]) + abs(a[2] - b[2]) <= 64:
+                    continue
+                dr, dg, db = b[0] - a[0], b[1] - a[1], b[2] - a[2]
+                len2 = dr * dr + dg * dg + db * db
+                if len2 < 4800:
+                    continue
+                pr, pg, pb = p[0] - a[0], p[1] - a[1], p[2] - a[2]
+                t = (pr * dr + pg * dg + pb * db) / float(len2)
+                if 0.12 < t < 0.88:
+                    qr, qg, qb = pr - t * dr, pg - t * dg, pb - t * db
+                    if qr * qr + qg * qg + qb * qb <= min(900.0, 0.12 * len2):
+                        is_trans = True
+                        break
+            if is_trans:
+                keep[i] = 0
+    return keep
 
 
-def make_palette(fgpx, k):
-    cnt = {}
-    for p in fgpx:
-        key = (p[0] >> 3, p[1] >> 3, p[2] >> 3)
-        cnt[key] = cnt.get(key, 0) + 1
-    pts = [((kk[0] * 8 + 4, kk[1] * 8 + 4, kk[2] * 8 + 4), n ** 0.7) for kk, n in cnt.items()]
-    cen = wmedian_cut(pts, k)
-    for _ in range(6):                       # Lloyd refinement
+def extract_tile_modes(cnt, merge_dist=900.0):
+    """Group non-transition pixels in one area around its local base color modes without diluting small details."""
+    items = sorted(cnt.items(), key=lambda kv: -kv[1])
+    modes = []
+    for kk, n in items:
+        c = (kk[0] * 4 + 2.0, kk[1] * 4 + 2.0, kk[2] * 4 + 2.0)
+        best_j, best_d = -1, merge_dist
+        for j, m in enumerate(modes):
+            mc = (m[0] / m[3], m[1] / m[3], m[2] / m[3])
+            d = dist(c, mc)
+            if d < best_d:
+                best_d, best_j = d, j
+        if best_j >= 0:
+            m = modes[best_j]
+            m[0] += c[0] * n; m[1] += c[1] * n; m[2] += c[2] * n; m[3] += n
+        else:
+            modes.append([c[0] * n, c[1] * n, c[2] * n, float(n)])
+    return [((m[0] / m[3], m[1] / m[3], m[2] / m[3]), m[3]) for m in modes]
+
+
+def make_palette_by_area(px, mask, w, h, x0, y0, x1, y1, k):
+    """Identify base colors area by area (ignoring transition pixels) and preserve distinct detail colors."""
+    keep = find_non_transition(px, mask, w, h, x0, y0, x1, y1)
+    fw, fh = x1 - x0, y1 - y0
+    gx = max(1, min(8, fw // 4 or 1))
+    gy = max(1, min(8, fh // 4 or 1))
+    step = 2 if (fw * fh > 450000) else 1
+    area_modes = []
+    for ty in range(gy):
+        ya = y0 + (ty * fh) // gy
+        yb = y0 + ((ty + 1) * fh) // gy
+        if yb <= ya:
+            continue
+        for tx in range(gx):
+            xa = x0 + (tx * fw) // gx
+            xb = x0 + ((tx + 1) * fw) // gx
+            if xb <= xa:
+                continue
+            cnt, nfg = {}, 0
+            for y in range(ya, yb, step):
+                row_off = y * w
+                for x in range(xa, xb, step):
+                    i = row_off + x
+                    if keep[i]:
+                        p = px[i]
+                        key = (p[0] >> 2, p[1] >> 2, p[2] >> 2)
+                        cnt[key] = cnt.get(key, 0) + 1
+                        nfg += 1
+            if not nfg:
+                continue
+            for col, bw in extract_tile_modes(cnt, merge_dist=900.0):
+                if nfg >= 10 and bw < 2.0:
+                    continue
+                area_modes.append((col, bw))
+    if not area_modes:
+        fg_cnt = {}
+        for i, m in enumerate(mask):
+            if m:
+                p = px[i]
+                key = (p[0] >> 2, p[1] >> 2, p[2] >> 2)
+                fg_cnt[key] = fg_cnt.get(key, 0) + 1
+        area_modes = [((kk[0] * 4 + 2.0, kk[1] * 4 + 2.0, kk[2] * 4 + 2.0), float(n)) for kk, n in fg_cnt.items()]
+    area_modes.sort(key=lambda it: -it[1])
+    clusters = []
+    for col, bw in area_modes:
+        best_j, best_d = -1, 400.0
+        for j, cl in enumerate(clusters):
+            mc = (cl[0] / cl[3], cl[1] / cl[3], cl[2] / cl[3])
+            d = dist(col, mc)
+            if d < best_d:
+                best_d, best_j = d, j
+        if best_j >= 0:
+            cl = clusters[best_j]
+            cl[0] += col[0] * bw; cl[1] += col[1] * bw; cl[2] += col[2] * bw; cl[3] += bw
+        else:
+            clusters.append([col[0] * bw, col[1] * bw, col[2] * bw, bw])
+    cands = [((cl[0] / cl[3], cl[1] / cl[3], cl[2] / cl[3]), cl[3]) for cl in clusters]
+    if len(cands) <= k:
+        return [tuple(max(0, min(255, int(round(v)))) for v in c) for c, _ in cands]
+    # Diversity-first selection: distinct detail colors beat minor variations of large zones
+    first_idx = max(range(len(cands)), key=lambda idx: cands[idx][1])
+    cen = [cands[first_idx][0]]
+    min_d = [dist(c, cen[0]) for c, _ in cands]
+    while len(cen) < k:
+        best_i, best_score = None, -1.0
+        for idx, (c, wt) in enumerate(cands):
+            if min_d[idx] <= 0.0:
+                continue
+            score = min_d[idx] * (wt ** 0.10)
+            if score > best_score:
+                best_score, best_i = score, idx
+        if best_i is None:
+            break
+        nc = cands[best_i][0]
+        cen.append(nc)
+        for idx, (c, _) in enumerate(cands):
+            d = dist(c, nc)
+            if d < min_d[idx]:
+                min_d[idx] = d
+    for _ in range(4):                       # Log-weighted Lloyd refinement keeps small details anchored
         sums = [[0.0, 0.0, 0.0, 0.0] for _ in cen]
-        for c, w in pts:
+        for c, wt in cands:
+            w = math.log1p(wt)
             j = min(range(len(cen)), key=lambda x: dist(c, cen[x]))
-            s = sums[j]; s[0] += c[0] * w; s[1] += c[1] * w; s[2] += c[2] * w; s[3] += w
+            s = sums[j]
+            s[0] += c[0] * w; s[1] += c[1] * w; s[2] += c[2] * w; s[3] += w
         cen = [(s[0] / s[3], s[1] / s[3], s[2] / s[3]) if s[3] else cen[j] for j, s in enumerate(sums)]
-    return [tuple(int(round(v)) for v in c) for c in cen]
+    return [tuple(max(0, min(255, int(round(v)))) for v in c) for c in cen]
 
 
-def lift(c, target=115.0, kmax=5.0):
-    L = 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2]
-    k = min(kmax, max(1.0, target / max(L, 1.0)))
-    return tuple(min(255, int(v * k)) for v in c)
+def tone_lift(c, floor=32.0, gamma=0.82):
+    """Raise black floor smoothly while preserving hue and monotonic tonal separation."""
+    m = max(c)
+    if m <= 0:
+        v = int(round(floor))
+        return (v, v, v)
+    m_new = floor + (255.0 - floor) * ((m / 255.0) ** gamma)
+    k = m_new / float(m)
+    return tuple(min(255, int(round(v * k))) for v in c)
 
 
 def lum_of(c):
@@ -709,22 +843,27 @@ def convert(src, dst, thr=14, K=NCOLORS):
         if i >= w: stack.append(i - w)
         if i < w * (h - 1): stack.append(i + w)
     mask = [not (isbg[i] or px[i][3] < 64) for i in range(w * h)]
-    fgpx = [(p[0], p[1], p[2]) for p, m in zip(px, mask) if m]
-    if not fgpx: die("no content found besides the background: %s" % src)
-    pal = make_palette(fgpx[::max(1, len(fgpx) // 40000)], K)
+    y0, y1, x0, x1 = h, 0, w, 0
+    for y in range(h):
+        row = mask[y * w:(y + 1) * w]
+        if any(row):
+            if y < y0: y0 = y
+            y1 = y + 1
+            lx = row.index(True)
+            rx = w - row[::-1].index(True)
+            if lx < x0: x0 = lx
+            if rx > x1: x1 = rx
+    if y0 >= y1: die("no content found besides the background: %s" % src)
+    pal = make_palette_by_area(px, mask, w, h, x0, y0, x1, y1, K)
     cache, plane = {}, bytearray(w * h)
     for i, (p, m) in enumerate(zip(px, mask)):
         if not m: continue
-        key = (p[0] >> 3, p[1] >> 3, p[2] >> 3)
+        key = (p[0] >> 2, p[1] >> 2, p[2] >> 2)
         v = cache.get(key)
         if v is None:
             v = cache[key] = min(range(len(pal)), key=lambda j: dist(p, pal[j])) + 1
         plane[i] = v
     rows = [plane[y * w:(y + 1) * w] for y in range(h)]
-    ys = [y for y in range(h) if any(rows[y])]
-    y0, y1 = ys[0], ys[-1] + 1
-    x0 = min(w - len(r.lstrip(b"\0")) for r in rows[y0:y1])
-    x1 = max(len(r.rstrip(b"\0")) for r in rows[y0:y1])
     crop = b"".join(bytes(rows[y][x0:x1]) for y in range(y0, y1))
     data = MAGIC + struct.pack("<HHB", x1 - x0, y1 - y0, len(pal)) + b"".join(bytes(c) for c in pal) + zlib.compress(crop, 9)
     open(dst, "wb").write(data)
@@ -790,7 +929,7 @@ class Style:
         self.pal, self.mode, self.fill = pal, mode, fill
         k = len(pal)
         lum = [lum_of(c) for c in pal]
-        self.col = [tuple(min(255, int(v * 1.2)) for v in lift(c, 100.0)) for c in pal]   # glyph-only colors: dark ones raised, +20% gain to offset glyph ink coverage
+        self.col = [tone_lift(c) for c in pal]   # glyph-only colors: preserve hue and tonal differences above black floor
         if mode == "tty":
             order = sorted(range(k), key=lambda i: -plane.count(bytes([i + 1])))
             self.slot = {}
@@ -798,12 +937,13 @@ class Style:
                 self.slot[i] = BGSLOTS[rank] if rank < len(BGSLOTS) else FGSLOTS[rank - len(BGSLOTS)]
             self.glyph, self.solid_fg = {}, {}
             for i in range(k if fill == "bg" else 0):
-                if lum[i] >= 60: self.glyph[i] = self.slot[i]
+                if lum[i] >= 35 or max(pal[i]) >= 60:
+                    self.glyph[i] = self.slot[i]
                 else:
-                    c = [j for j in range(k) if j != i and lum[j] >= 60]
-                    self.glyph[i] = self.slot[min(c, key=lambda j: dist(lift(pal[i]), pal[j]))] if c else 7
-                t = tuple(min(255, int(v * 1.25 + 35)) for v in pal[i])
-                c = [j for j in range(k) if j != i and lum[j] > lum[i] + 25]
+                    c = [j for j in range(k) if j != i and (lum[j] >= 35 or max(pal[j]) >= 60) and dist(pal[i], pal[j]) < 12000]
+                    self.glyph[i] = self.slot[min(c, key=lambda j: dist(tone_lift(pal[i]), pal[j]))] if c else self.slot[i]
+                t = tuple(min(255, int(v * 1.25 + 25)) for v in pal[i])
+                c = [j for j in range(k) if j != i and lum[j] > lum[i] + 15 and dist(t, pal[j]) < 9000]
                 self.solid_fg[i] = self.slot[min(c, key=lambda j: dist(t, pal[j]))] if c else self.slot[i]
 
     def rgb(self, i):
@@ -816,8 +956,8 @@ class Style:
             if solid and self.slot[i] in BGSLOTS: return (self.solid_fg[i], self.slot[i])
             return (self.glyph[i], None)
         c = self.pal[i]
-        if solid: return (tuple(min(255, int(v * 1.25 + 35)) for v in c), c)
-        return (lift(c), None)
+        if solid: return (tuple(min(255, int(v * 1.25 + 25)) for v in c), c)
+        return (tone_lift(c), None)
 
     def seq(self, key):
         fg, bg = key
@@ -850,7 +990,7 @@ def emit(cells, style, pad):
 
 
 def art_lines(path, tbn, mode, H, W, pad, fill):
-    key = hashlib.md5(("%s|%s|%d|%d|%d|%d|%s|%s" % (os.path.basename(path), os.path.getmtime(path), os.path.getsize(path), H, W, pad, fill, RAMP)).encode()).hexdigest()
+    key = hashlib.md5(("%s|%s|%d|%d|%d|%d|%s|%s|v2" % (os.path.basename(path), os.path.getmtime(path), os.path.getsize(path), H, W, pad, fill, RAMP)).encode()).hexdigest()
     cf = P("/var/lib/tty-banner/cache/%s.%s" % (key, mode))
     try:
         return open(cf).read().split("\n")
